@@ -86,51 +86,6 @@ app.get('/users', async (req, res) => {
         email: user.email,
         password: user.password
     })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // const { username, email } = req.body;
-
-    // if (!username && !email) {
-    //     return res.status(400).json({
-    //         message: 'username or email is required'
-    //     });
-    // }
-
-    // const user = await User.findOne(
-    //     username ? { username } : { email }
-    // ).lean();
-
-    // if (!user) {
-    //     return res.status(404).json({
-    //         message: 'user not found'
-    //     });
-    // }
-
-    // return res.status(200).json({
-    //     username: user.username,
-    //     email: user.email,
-    //     password: user.password
-    // });
 });
     
 
