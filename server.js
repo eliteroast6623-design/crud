@@ -1,232 +1,972 @@
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const createClient = require('redis').createClient;
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const cloudinary = require('cloudinary').v2;
 
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+})
+
+const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/jxl']
+const MAX_AVATAR_SIZE = 5 * 1024 * 1024;
+const middleware = (req, res, next) => {
+const authHeader = req.headers['authorization'];
+const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ message:
+            'access token is missing'
+        })
+    }
+
+    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ message:
+                'invalid access token'
+            })
+        }
+        req.user = user;
+        next();
+    })}
+    
 const app = express();
-app.use(express.json());
+
+    app.use(express.json());
+
 const redis = createClient({
     url: 'redis://127.0.0.1:6379'
 });
 
-redis.on('error', (err) => console.log('Redis Client Error', err));
+    redis.on('error', (err) => console.log('Redis Client Error', err));
 
-mongoose.connect('mongodb://localhost:27017/')
-.then(() => {console.log('connected to database')})
-.catch((err) => {console.log('error in connecting')});
+app.get('/healthz', (req, res) => {
+    res.status(200).json({ message: 'ok' });
+});
+
+app.get('/readyz' , (req, res) => {
+const mongoReady = mongoose.connection.readyState === 1;
+const redisReady = redis.isReady;
+
+    if (!mongoReady || !redisReady) {
+        return res.status(503).json({
+            status: 'not ready',
+            mongo: mongoReady,
+            redis: redisReady
+        });
+    }
+
+    return res.status(200).json({
+        status: 'ready',
+        mongo: true,
+        redis: true
+    });
+});
+
+const authActivitySchema = new mongoose.Schema({
+    userId: {
+        type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true
+    },
+    eventType: { 
+        type: String, enum: ['login', 'otp-login'], required: true
+    },
+    createdAt: {
+        type: Date, default: Date.now
+    }
+});
+
+const AuthActivity = mongoose.model('AuthActivity', authActivitySchema);
+
+    mongoose.connect('mongodb://localhost:27017/')
+    .then(() => {console.log('connected to database')})
+    .catch((err) => {console.log('error in connecting')});
 
 const userSchema = new mongoose.Schema({
-    username:{
-        type: String,
-        unique: true,
-        required: true,        
+    phone:{
+        type: String, unique: true, required: true
+    },
+    countryCode:{
+        type: String, required: true
     },
     email:{
-        type: String,
-        required: true,
-        unique: true,
-        },
-
+        type: String, required: true, unique: true
+    },
     password:{
-        type: String,
-        required: true,
-      },
-    })
+        type: String, required: true
+    },
+    username:{
+        type: String, required: true,       
+    },
+    address:{
+        type: String, required: true,
+    },
+    dateOfBirth:{
+        type: String, required: true,
+    },
+    signedIn:{
+        type: Boolean, default: false
+    },
+    avatar:{
+        secureUrl:{
+            type: String, default: null
+        },
+        publicId:{
+            type: String, default: null
+        },
+        contentType:{
+            type: String, default: null
+        },
+        size:{
+            type: Number, default: null
+        }
+    }
+})
 
 const User = mongoose.model('User', userSchema);
 
 app.post('/users', async (req, res) => {
 
-    const {username, email, password} = req.body;
+const {phone, countryCode, email, password, username, address, dateOfBirth } = req.body;
 
-    if(!username || !email || !password){
-        return res.status(400).json({message: 
-            !username ? 'username is required' : !email ? 'email is required' : 'password is required'});
-    }
+const missingFields = [];
 
-    const existingUser = await User.findOne({$or: [{username}, {email}]});
-    if(existingUser){
-        return res.status(400).json({message: 'username or email already exists'});
-    }
+    if (!phone) missingFields.push('phone');
+    if (!countryCode) missingFields.push('countryCode');
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+    if (!username) missingFields.push('username');
+    if (!address) missingFields.push('address');
+    if (!dateOfBirth) missingFields.push('dateOfBirth');
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const user = new User({
-        username,
-        email,
-        password: hashedPassword,
+    if (missingFields.length > 0) {
+    return res.status(400).json({
+        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
     });
+}
+
+const phoneExists = await User.exists({phone});
+const emailExists = await User.exists({email});
+
+    if(phoneExists || emailExists){
+        return res.status(400).json({
+            message: phoneExists ? (emailExists ? 'phone no. and email already exists' : 'phone no. already exists') : 'email already exists'
+        })
+    }
+
+const hashedPassword = await bcrypt.hash(password, 13);
+
+const user = new User({
+    phone, countryCode, email, password: hashedPassword, username, address, dateOfBirth,
+    });
+
+const redirect = (path) => {
+    return path;
+}
 
     await user.save();
 
-    res.status(201).json({message: 'user registered successfully'});
+    res.status(201).json({message: 'created user resource', next: redirect('/users/otp/request')});
+    }
+);
+
+
+app.post('/users/otp/request', async (req, res) => {
+
+const {phone, countryCode, email, password, username, address, dateOfBirth } = req.body;
+
+const missingFields = [];
+
+    if (!phone) missingFields.push('phone');
+    if (!countryCode) missingFields.push('countryCode');
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+    if (!username) missingFields.push('username');
+    if (!address) missingFields.push('address');
+    if (!dateOfBirth) missingFields.push('dateOfBirth');
+
+    if (missingFields.length > 0) {
+    return res.status(400).json({
+        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+    });
+}
+
+const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}]});
+
+const notMatchedFields = [];
+
+    if (!user) {
+        return res.status(404).json({ message: 'user not found' });
+    }
+
+    if (user.phone !== phone) notMatchedFields.push('phone');
+    if (user.countryCode !== countryCode) notMatchedFields.push('countryCode');
+    if (user.email !== email) notMatchedFields.push('email');
+    if (user.username !== username) notMatchedFields.push('username');
+    if (user.address !== address) notMatchedFields.push('address');
+    if (user.dateOfBirth !== dateOfBirth) notMatchedFields.push('dateOfBirth');
+
+    if (notMatchedFields.length > 0) {
+        return res.status(404).json({
+            message: `${notMatchedFields.join(', ')} ${notMatchedFields.length === 1 ? 'does' : 'do'} not match`
+        });
+    }
+
+    if(!await bcrypt.compare(password, user.password)){
+        return res.status(400).json({message: 'incorrect password'});
+    }
+
+const cooldown = await redis.get(`otp:cooldown:${phone}`);
+
+    if(cooldown){
+        return res.status(429).json({message: 'wait for 30 seconds'});
+    }
+
+const otp = crypto.randomInt(100000, 999999).toString();
+const otpHash = await bcrypt.hash(otp, 13);
+
+    await redis.set(`otp:${phone}`, otpHash, {
+        EX: 300
+    });
+
+    await redis.set(`otp:cooldown:${phone}`, '1', { EX: 30 });
+    console.log('OTP:', otp);
+
+const redirect = (path) => {
+    return path;
+    }
+
+    return res.status(200).json({
+        message: 'OTP sent successfully', next: redirect('/users/otp/verify')
+   })
 });
 
-app.get('/users', async (req, res) => {
 
-    const {username, email} = req.body;
+app.post('/users/otp/verify', async (req, res) => {
 
-    if(!username && !email){
-        return res.status(400).json({message: 'username or email is required'});
+const {phone, countryCode, email, password, username, address, dateOfBirth, otp } = req.body;
+
+const missingFields = [];
+
+    if (!phone) missingFields.push('phone');
+    if (!countryCode) missingFields.push('countryCode');
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+    if (!username) missingFields.push('username');
+    if (!address) missingFields.push('address');
+    if (!dateOfBirth) missingFields.push('dateOfBirth');
+    
+    if (missingFields.length > 0) {
+    return res.status(400).json({
+        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+    });
+}
+
+const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}]});
+
+const notMatchedFields = [];
+
+    if (!user) {
+        return res.status(404).json({ message: 'user not found' });
     }
 
-    const rediskey = username
+    if (user.phone !== phone) notMatchedFields.push('phone');
+    if (user.countryCode !== countryCode) notMatchedFields.push('countryCode');
+    if (user.email !== email) notMatchedFields.push('email');
+    if (user.username !== username) notMatchedFields.push('username');
+    if (user.address !== address) notMatchedFields.push('address');
+    if (user.dateOfBirth !== dateOfBirth) notMatchedFields.push('dateOfBirth');
 
-    ? `user:username:${username}`
-    : `email:${email}`;
+    if (notMatchedFields.length > 0) {
+        return res.status(404).json({
+            message: `${notMatchedFields.join(', ')} ${notMatchedFields.length === 1 ? 'does' : 'do'} not match`
+        });
+    } 
 
-    const cachedUser = await redis.get(rediskey);
+const otpKey = `otp:${phone}`;
+const attemptsKey = `otp:attempts:${phone}`;
+const sharedOtpHash = await redis.get(otpKey);
 
-    if(cachedUser){
-
-        console.log('User Found In Redis');
-
-        const user = JSON.parse(cachedUser);
-
-    if(username && user.username !== username){
-        return res.status(404).json({message: 'username not matched'});
+    if (!sharedOtpHash) {
+        return res.status(400).json({
+            message: 'OTP expired or wrong otp'
+        });
     }
 
-    if(email && user.email !== email){
-        return res.status(404).json({message: 'email not matched'});
+const attempts = Number(await redis.get(attemptsKey)) || 0;
+
+    if (attempts >= 5) {
+        await redis.del(otpKey);
+        await redis.del(attemptsKey);
+
+        return res.status(400).json({
+            message: 'too many attempts'
+        })
     }
-        return res.status(200).json(user);
+
+const isValidOtp = await bcrypt.compare(otp, sharedOtpHash);
+
+    if (!isValidOtp) {
+const newAttempts = attempts + 1;
+
+    if (newAttempts >= 5) {
+        await redis.del(otpKey);
+        await redis.del(attemptsKey);
+        return res.status(400).json({
+            message: 'too many incorrect attempts'
+        })
     }
 
-    console.log('User Not Find In Redis, Checking MongoDB');
+        await redis.set(
+            attemptsKey,
+            newAttempts,
+            { EX: 300 }
+        )
 
-    const user = await User.findOne({$or: [{username: username}, {email: email}]});
+        return res.status(400).json({
+            message: `Invalid OTP. ${5 - newAttempts} attempts remaining`
+        });
+    }
 
+const accessToken = jwt.sign(
+    { userId: user._id },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: '15m' }
+);
+const refreshToken = jwt.sign(
+    { userId: user._id },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: '7d' }
+);
+
+    await AuthActivity.create({
+    userId: user._id,
+    eventType: 'otp-login'
+});
+
+    await redis.del(otpKey);
+    await redis.del(attemptsKey);
+
+const redirect = (path) => {
+        return path;
+    }
+
+    return res.status(200).json({
+        message: 'OTP verified', accessToken, refreshToken, next: redirect('/users/login')
+    })
+})
+    
+
+app.post('/users/login', async (req, res) => {
+
+const {username, email, password} = req.body;
+
+const missingFields = [];
+
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+    if (!username) missingFields.push('username');
+    
+    if (missingFields.length > 0) {
+    return res.status(400).json({
+        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+    });
+}
+
+const user = await User.findOne({$or: [{username}, {email}]});
     if(!user){
         return res.status(404).json({message: 'user not found'});
     }
-    if(username && user.username !== username){
-        return res.status(404).json({message: 'username not matched'});
+
+    if(!await bcrypt.compare(password, user.password)){
+        return res.status(400).json({message: 'incorrect password'});
     }
-    if(email && user.email !== email){
-        return res.status(404).json({message: 'email not matched'});
+const accessToken = jwt.sign(
+        { userId: user._id },
+        process.env.ACCESS_TOKEN_SECRET,
+        { expiresIn: '15m' }
+    );
+const refreshToken = jwt.sign(
+        { userId: user._id },
+        process.env.REFRESH_TOKEN_SECRET,
+        { expiresIn: '7d' }
+    );
+    await AuthActivity.create({
+        userId: user._id,
+        eventType: 'login'
+});
+const signInStatus = await User.findOneAndUpdate(
+        { $or: [{ username }, { email }] },
+        { $set: { signedIn: true } },
+        { new: true }
+    );
+
+    redirect = (path) => {
+        return path;
     }
 
-    const userData = {
-        username: user.username,
-        email: user.email,
-        password: user.password
-    };
+    await user.save();
 
-    await redis.set(rediskey, JSON.stringify(userData), {
-        EX: 300
+    return res.status(200).json({message: 'login successful', accessToken, refreshToken, next: redirect('/users/me')});
     });
+
+
+app.get('/users/me', middleware,async (req, res) => {
+
+    try {
+
+const userId = req.user.userId;
+const redisKey = `user:profile:${userId}`;
+const cachedUser = await redis.get(redisKey);
+
+    if (cachedUser) {
+        console.log('User Found In Redis');
+
+const user = JSON.parse(cachedUser);
+        return res.status(200).json(user);
+    }
+
+    console.log('User Not Found In Redis, Checking MongoDB');
+
+const user = await User.findById(userId).select(
+        'phone countryCode username email address dateOfBirth'
+    );
+
+    if (!user) {                                                   
+        return res.status(404).json({                                                   
+            message: 'user not found'                                                   
+    });                                                   
+}
+
+const userData = {
+    phone: user.phone,
+    countryCode: user.countryCode,
+    username: user.username,
+    email: user.email,
+    address: user.address,
+    dateOfBirth: user.dateOfBirth
+};
+
+    await redis.set(
+        redisKey,
+        JSON.stringify(userData),
+        {
+            EX: 300
+        }
+    );
 
     console.log('User Found In MongoDB, Saving To Redis');
 
     return res.status(200).json(userData);
+
+    } catch (error) {
+
+    console.log(error);
+
+    return res.status(500).json({
+        message: 'server error',
+    });
+}
 });
 
 
-app.put('/users', async (req, res) => {
-    const { username, email, password, newUsername, newEmail, newPassword } = req.body;
+app.post('/users/logout', async (req, res) => {
 
-   if (!username && !email && !password) {
-    return res.status(400).json({ message: 'Please provide username, email, or password' });
-}
+const {phone, email} = req.body;
 
-if (!!username !== !!newUsername) {
-    return res.status(400).json({
-        message: username ? 'Please provide new username' : 'Please provide username'
-    });
-}
-
-if (!!email !== !!newEmail) {
-    return res.status(400).json({
-        message: email ? 'Please provide new email' : 'Please provide email'
-    });
-}
-
-if (newPassword && !password) {
-    return res.status(400).json({ message: 'Please provide current password' });
-}
-
-    const user = await User.findOne({
-        $or: [
-            ...(username ? [{ username }] : []),
-            ...(email ? [{ email }] : [])
-        ]
-    });
-
-   if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-}
-
-if (username && user.username !== username) {
-    return res.status(400).json({ message: 'Incorrect username' });
-}
-
-if (email && user.email !== email) {
-    return res.status(400).json({ message: 'Incorrect email' });
-}
-
-if (password && !(await bcrypt.compare(password, user.password))) {
-    return res.status(400).json({ message: 'Incorrect password' });
-}
-
-    const unchangedFields = [];
-    if (newUsername && newUsername === user.username) {
-        unchangedFields.push('new username and old username are the same');
-    }
-    if (newEmail && newEmail === user.email) {
-        unchangedFields.push('new email and old email are the same');
+    if(!phone || !email){
+        return res.status(400).json({message:
+            !phone ? (!email ? 'phone no. and email are required' : 'phone no. is required') : (!email ? 'email is required' : '')
+        })
     }
 
-    if (unchangedFields.length > 0) {
+const user = await User.findOne({$or: [{phone}, {email}]});
+    
+    if(!user){
+        return res.status(404).json({message:
+            'user not found'
+        })
+    }
+
+    if(user.phone !== phone || user.email !== email){
+        return res.status(404).json({message:
+            user.phone !== phone ? (user.email !== email ? 'phone no. and email not matched' : 'phone no. not matched') : 'email not matched'
+     })
+    }
+    if(!user.signedIn){
+        return res.status(400).json({message: 'user is not signed in'});
+    }
+    
+const signoutStatus = await user.updateOne(
+        { $set: { signedIn: false } },
+        { new: true }
+    );
+    return res.status(200).json({message: 'logout successful'});
+});
+
+
+app.get('/users/:id', async (req, res) => {
+
+const { id } = req.params;
+
+    try {
+
+const existingUser = await User.findById(id)
+    
+    if (!existingUser) {
+        return res.status(404).json({
+            message: 'user not found'
+        })
+    }
+
+    return res.status(200).json({
+        username: existingUser.username,
+        countryCode: existingUser.countryCode,
+        avatar: existingUser.avatar
+    });
+
+    } catch (error) {
+        console.log(error);
+
+    return res.status(500).json({
+        message: 'Internal server error'
+    });
+    }
+});
+
+
+app.patch('/users/me/update/:id', async (req, res) => {
+
+const userId = req.params.id;
+
+const { username, email, password, address, dateOfBirth } = req.body;
+    
+    if (!username && !email && !password && !address && !dateOfBirth) {
         return res.status(400).json({
-            message: unchangedFields.join(' and ')
+            message: 'please provide at least one field'
+        })
+    }
+
+const updateUser = Object.fromEntries(
+    Object.entries({ username, email, password, address, dateOfBirth })
+        .filter(([value]) => value !== undefined)
+    );
+
+    if (password !== undefined) {
+        updateUser.password = await bcrypt.hash(password,13);
+    }
+
+const existingUser = await User.findById(userId);
+
+    if (!existingUser) {
+        return res.status(404).json({
+            message: 'User not found'
         });
     }
 
-    const conflictingFields = [];
-    const existingUsers = await User.find({
-        $or: [
-            ...(newUsername ? [{ username: newUsername }] : []),
-            ...(newEmail ? [{ email: newEmail }] : [])
-        ]
-    });
+const updatedUser = await User.findByIdAndUpdate(
+    userId,
+        { $set: updateUser },
+        {
+            returnDocument: 'after',
+            runValidators: true
+        }
+    ).select('-password');
+    
 
-    for (const existingUser of existingUsers) {
-        if (existingUser._id.toString() === user._id.toString()) {
-            continue;
-        }
-        if (newUsername && existingUser.username === newUsername) {
-            conflictingFields.push('new username');
-        }
-        if (newEmail && existingUser.email === newEmail) {
-            conflictingFields.push('new email');
-        }
+    return res.status(200).json({
+        message: 'Profile updated successfully',
+        user: updatedUser
+    });
+});
+
+
+app.put('/users/me/replace/:id', async (req, res) => {
+
+const userId = req.params.id;
+
+const { username, email, password, address, dateOfBirth } = req.body;
+    
+    if (!username && !email && !password && !address && !dateOfBirth) {
+        return res.status(400).json({
+            message: 'please provide at least one field'
+        })
     }
 
-    if (conflictingFields.length > 0) {
-        return res.status(400).json({
-            message: `${conflictingFields.join(' and ')} already exist`
+const existingUser = await User.findById(userId);
+
+    if (!existingUser) {
+        return res.status(404).json({
+            message: 'User not found'
         });
     }
 
-    if (newUsername) {
-        user.username = newUsername;
-    }
+const updateUser = Object.fromEntries(
+    Object.entries({ username, email, address, dateOfBirth })
+        .map(([key, value]) => [key, value ?? null])
+        );
 
-    if (newEmail) {
-        user.email = newEmail;
-    }
+const updatedUser = await User.findByIdAndUpdate(
+    userId,
+        { $set: updateUser },
+        { returnDocument : 'after',}
+    ).select('-password');
+    const hashedPassword = await bcrypt.hash(password, 13);
+    updatedUser.password = hashedPassword;
+    await updatedUser.save();
 
-    if (newPassword) {
-        if (await bcrypt.compare(newPassword, user.password)) {
-            return res.status(400).json({ message: 'New password and old password are the same' });
+    return res.status(200).json({
+        message: 'profile replaced',
+        user: updatedUser})
+    });
+
+
+app.post('/users/me/avatar/presign', middleware, async (req, res) => {
+
+    try {
+
+const userId = req.user.userId;
+
+const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/jxl'];    
+
+const { contentType } = req.body;
+
+    if (!contentType) {
+        return res.status(400).json({
+            message: 'contentType is required'
+    });
         }
-        user.password = await bcrypt.hash(newPassword, 10);
+
+    if (!ALLOWED_CONTENT_TYPES.includes(contentType)){
+        return res.status(400).json({
+            message: 'unsupported content type'
+        })
     }
+
+const randomId = crypto.randomUUID();
+const folder = `avatars/${userId}`;
+const publicId = randomId;
+const timestamp = Math.floor(Date.now() / 1000);
+const signature = cloudinary.utils.api_sign_request({
+    
+    timestamp: timestamp,
+    folder: folder,
+    public_id: publicId
+},
+    process.env.CLOUDINARY_API_SECRET
+);
+
+    return res.status(200).json({message:
+        'Avatar upload authorization generated',
+
+    cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+    apiKey: process.env.CLOUDINARY_API_KEY,
+    timestamp,
+    signature,
+    folder:folder,
+    publicId,
+    contentType,
+    maxSize:MAX_AVATAR_SIZE
+    });} 
+    
+    catch (error) {
+    console.error('Avatar presign error:',error);
+
+    return res.status(500).json({message:
+        'Failed to generate avatar upload authorization'
+    });
+}});
+
+
+app.post('/users/me/avatar/confirm', middleware, async (req, res) => {
+        
+    try {
+        
+const userId = req.user.userId;
+
+const { publicId } = req.body;
+
+    if (!publicId) {
+        return res.status(400).json({ message:
+            'publicId is required'
+                });
+            }
+            
+const expectedPrefix =`avatars/${userId}/`;
+
+    if (!publicId.startsWith(expectedPrefix)) {
+        return res.status(403).json({
+            message: 'Invalid avatar object'
+                });
+            } 
+
+    let resource;
+
+    try {resource =
+        await cloudinary.api.resource(publicId,{
+            resource_type: 'image',
+            type: 'upload'
+    });
+    }
+
+    catch (error) {if (error?.http_code === 404) {
+        return res.status(404).json({message:
+            'Uploaded avatar not found'
+        }); 
+    }
+    throw error;
+    }
+
+    if (resource.resource_type !== 'image') {
+        await cloudinary.uploader.destroy(
+            publicId,
+            {
+            resource_type: 'image',
+            type: 'upload'
+            }
+        );
+
+    return res.status(400).json({message:
+        'Uploaded object is not an image'
+        });
+    }
+
+const allowedFormats = ['jpg', 'jpeg', 'png', 'webp', 'jxl'];
+const actualFormat =resource.format?.toLowerCase();
+  
+    if (!allowedFormats.includes(actualFormat)) {
+        await cloudinary.uploader.destroy(
+            publicId,{
+                resource_type: 'image',
+                type: 'upload'
+            }
+        );
+
+    return res.status(400).json({message:
+        'Unsupported avatar format'
+        });
+    }
+
+const actualSize = resource.bytes;
+
+    if (
+        typeof actualSize !== 'number' ||
+        actualSize <= 0 ||
+        actualSize > MAX_AVATAR_SIZE
+        ) {
+        await cloudinary.uploader.destroy(
+            publicId,
+        {
+            resource_type: 'image',
+            type: 'upload'
+        });
+
+    return res.status(400).json({message:
+        'Avatar size exceeds allowed limit'
+            });
+        }
+
+const formatToContentType = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    webp: 'image/webp',
+    jxl: 'image/jxl'
+    };
+
+const actualContentType =formatToContentType[actualFormat];
+const user = await User.findById(userId);
+
+    if (!user) {
+        await cloudinary.uploader.destroy(
+            publicId,{
+                resource_type: 'image',
+                type: 'upload'
+            });
+
+    return res.status(404).json({message:
+        'User not found'
+    });
+}
+
+const oldAvatarPublicId =
+    user.avatar?.publicId || null;
+
+    user.avatar = {
+    publicId: publicId,
+    secureUrl: resource.secure_url,
+    contentType: actualContentType,
+    size: actualSize
+    };
 
     await user.save();
 
-    return res.status(200).json({ message: 'User updated successfully' });
+    if (
+        oldAvatarPublicId &&
+        oldAvatarPublicId !== publicId
+    ) {
+
+    try {
+    await cloudinary.uploader.destroy(
+        oldAvatarPublicId,
+        {
+            resource_type: 'image',
+            type: 'upload'
+        });
+    } 
+
+    catch (deleteError) {
+        console.error(
+            'Failed to delete old avatar:',
+                deleteError
+            );}
+        }
+
+    return res.status(200).json({message:
+        'Avatar updated successfully',
+            avatar: {
+                publicId:publicId,
+                secureUrl:resource.secure_url,
+                contentType:actualContentType,
+                size:actualSize
+            }
+        });
+    } 
+    
+    catch (error) {
+        console.error(
+            'Avatar confirmation error:', error
+        );
+
+    return res.status(500).json({message:
+        'Failed to confirm avatar'
+    });
+}
+});
+
+
+app.delete('/users/me/delete', middleware, async (req, res) => {
+
+    try {
+
+const userId = req.user.userId;
+const user = await User.findById(userId);
+
+    if (!user) {
+        return res.status(404).json({ message:
+            'user not found'
+        })
+    }
+
+    await redis.del(`refreshToken:${userId}`);
+    await redis.del(`user:profile:${userId}`);
+
+    if (user.avatar?.publicId) {
+        try {
+            await cloudinary.uploader.destroy(
+                user.avatar.publicId,
+                {
+                    resource_type: 'image',
+                    type: 'upload'
+                }
+            );
+        } 
+
+    catch (cloudinaryError){
+        console.error(
+            `failed to delete: ${cloudinaryError}`
+        );
+    }
+}
+
+    console.log(`logout activity for user: ${userId}`);
+    await User.findByIdAndDelete(userId);
+        return res.status(200).json({
+            message: 'account deleted'
+        })
+    }
+
+    catch (error) {
+        console.error('delete account error:', error);
+        return res.status(500).json({
+            message: 'failed to delete'
+        });
+    }
+}); 
+
+
+app.get('/users/:id/auth-activity', async (req, res) => {
+
+    try {
+        
+const { id } = req.params;
+const { eventType, from, to } = req.query;
+
+const filter = {
+    userId: new mongoose.Types.ObjectId(id)
+    }
+
+    if (eventType) {
+        filter.eventType = eventType;
+        }
+    if (from || to) {
+        filter.createdAt = {};
+        if (from && to) {
+            filter.createdAt.$gte = new Date(from);
+            filter.createdAt.$lte = new Date(to);
+        }
+    }
+
+const result = await AuthActivity.aggregate([{
+    $match: filter
+    },
+        {
+            $facet: {
+                totalLogins: [
+                    {
+                        $count: 'count'
+                    }
+                ],
+            loginTimestamps: [
+                {
+                    $sort: {
+                        createdAt: -1
+                        }
+                },
+                {
+                    $project: {
+                    _id: 0,
+                    eventType: 1,
+                    timestamp: '$createdAt'
+                    }
+                }
+            ]
+        }
+    }
+]);
+
+const totalLogins =
+    result[0].totalLogins.length > 0
+    ? result[0].totalLogins[0].count
+    :0;
+
+    return res.status(200).json({
+        userId: id,
+        totalLogins,
+        logins: result[0].loginTimestamps});
+    }
+ 
+    catch (error) {
+        console.error('auth activity error:', error);
+
+    return res.status(500).json({
+        message: 'Internal server error'
+    });
+}
 });
 
 redis.connect().then(() => {
