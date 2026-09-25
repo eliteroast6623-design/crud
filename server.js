@@ -20,20 +20,68 @@ const authHeader = req.headers['authorization'];
 const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) {
-        return res.status(401).json({ message:
-            'access token is missing'
-        })
+        return res.status(401).json({
+            message: 'access token is missing'
+        });
     }
 
-    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ message:
-                'invalid access token'
-            })
-        }
-        req.user = user;
+    jwt.verify(
+        token,
+            process.env.ACCESS_TOKEN_SECRET,
+                async (err, decoded) => {
+
+    if (err) {
+        return res.status(403).json({message: 
+            'invalid access token'
+        });
+    }
+
+    try {
+
+const revoked = await redis.get(`denylist:${decoded.jti}`);
+
+    if (revoked) {
+        return res.status(401).json({message: 
+            'access token revoked'
+        });
+    }
+
+const existingUser = await User.findById(
+    decoded.userId
+    ).select('deleted sessionVersion');
+
+    if (!existingUser) {
+        return res.status(401).json({message: 
+            'user not found'
+        });
+    }
+
+    if (existingUser.deleted) {
+        return res.status(401).json({message: 
+            'account deleted'
+        });
+    }
+
+    if (
+        decoded.sessionVersion !==
+            existingUser.sessionVersion
+            ) {
+                return res.status(401).json({message:
+                    'session revoked'
+                });
+            }
+
+    req.user = decoded;
         next();
-    })}
+        } catch (error) {
+            console.error('Auth middleware error:', error);
+                return res.status(500).json({message: 
+                    'Internal server error'
+                });
+            }
+        }
+    );
+};
     
 const app = express();
 
@@ -82,19 +130,19 @@ const authActivitySchema = new mongoose.Schema({
 
 const AuthActivity = mongoose.model('AuthActivity', authActivitySchema);
 
-    mongoose.connect('mongodb://localhost:27017/')
+    mongoose.connect('mongodb://localhost:27017/crud-app',)
     .then(() => {console.log('connected to database')})
     .catch((err) => {console.log('error in connecting')});
 
 const userSchema = new mongoose.Schema({
     phone:{
-        type: String, unique: true, required: true
+        type: String, required: true
     },
     countryCode:{
         type: String, required: true
     },
     email:{
-        type: String, required: true, unique: true
+        type: String, required: true
     },
     password:{
         type: String, required: true
@@ -124,10 +172,31 @@ const userSchema = new mongoose.Schema({
         size:{
             type: Number, default: null
         }
+    },
+    deleted: { 
+        type: Boolean, default: false 
+    },
+    version:{
+        type: Number, default: 0
+    },
+    sessionVersion:{
+        type: Number, default: 0
     }
 })
 
 const User = mongoose.model('User', userSchema);
+ 
+    User.collection.createIndex({
+        phone: 1,},
+            {unique: true,
+                partialFilterExpression: {deleted: false}
+            })
+
+    User.collection.createIndex({
+        email: 1,},
+            {unique: true,
+                partialFilterExpression: {deleted: false}
+            })
 
 app.post('/users', async (req, res) => {
 
@@ -149,8 +218,8 @@ const missingFields = [];
     });
 }
 
-const phoneExists = await User.exists({phone});
-const emailExists = await User.exists({email});
+const phoneExists = await User.exists({phone, deleted: false});
+const emailExists = await User.exists({email, deleted: false});
 
     if(phoneExists || emailExists){
         return res.status(400).json({
@@ -333,14 +402,21 @@ const newAttempts = attempts + 1;
     }
 
 const accessToken = jwt.sign(
-    { userId: user._id },
+    { userId: user._id,
+        sessionVersion: user.sessionVersion
+    },
     process.env.ACCESS_TOKEN_SECRET,
-    { expiresIn: '15m' }
+    { expiresIn: '15m',
+        jwtid: crypto.randomUUID() }
 );
 const refreshToken = jwt.sign(
-    { userId: user._id },
+    { userId: user._id,
+        sessionVersion: user.sessionVersion
+    },
     process.env.REFRESH_TOKEN_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: '7d',
+        jwtid: crypto.randomUUID()
+     }
 );
 
     await AuthActivity.create({
@@ -386,17 +462,21 @@ const user = await User.findOne({$or: [{username}, {email}]});
         return res.status(400).json({message: 'incorrect password'});
     }
 const accessToken = jwt.sign(
-        { userId: user._id },
+        { userId: user._id, sessionVersion: user.sessionVersion },
         process.env.ACCESS_TOKEN_SECRET,
-        { expiresIn: '15m' }
+        { expiresIn: '15m',
+            jwtid: crypto.randomUUID() }
     );
 const refreshToken = jwt.sign(
-        { userId: user._id },
+        { userId: user._id, sessionVersion: user.sessionVersion },
         process.env.REFRESH_TOKEN_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn: '7d',
+            jwtid: crypto.randomUUID()
+         }
     );
     await AuthActivity.create({
         userId: user._id,
+        sessionVersion: user.sessionVersion,
         eventType: 'login'
 });
 const signInStatus = await User.findOneAndUpdate(
@@ -405,7 +485,7 @@ const signInStatus = await User.findOneAndUpdate(
         { new: true }
     );
 
-    redirect = (path) => {
+    const redirect = (path) => {
         return path;
     }
 
@@ -433,7 +513,7 @@ const user = JSON.parse(cachedUser);
     console.log('User Not Found In Redis, Checking MongoDB');
 
 const user = await User.findById(userId).select(
-        'phone countryCode username email address dateOfBirth'
+        'phone countryCode username email address dateOfBirth version sessionVersion signedIn avatar'
     );
 
     if (!user) {                                                   
@@ -448,7 +528,11 @@ const userData = {
     username: user.username,
     email: user.email,
     address: user.address,
-    dateOfBirth: user.dateOfBirth
+    dateOfBirth: user.dateOfBirth,
+    version: user.version,
+    sessionVersion: user.sessionVersion,
+    signedIn: user.signedIn,
+    avatar: user.avatar
 };
 
     await redis.set(
@@ -474,29 +558,35 @@ const userData = {
 });
 
 
-app.post('/users/logout', async (req, res) => {
+app.post('/users/logout', middleware, async (req, res) => {
 
-const {phone, email} = req.body;
-
-    if(!phone || !email){
+const {jti, exp, userId} = req.user;
+    if(!jti || !exp){
         return res.status(400).json({message:
-            !phone ? (!email ? 'phone no. and email are required' : 'phone no. is required') : (!email ? 'email is required' : '')
+            'invalid access token'
         })
     }
+    const user = await User.findById(userId);
 
-const user = await User.findOne({$or: [{phone}, {email}]});
-    
     if(!user){
         return res.status(404).json({message:
             'user not found'
         })
     }
 
-    if(user.phone !== phone || user.email !== email){
-        return res.status(404).json({message:
-            user.phone !== phone ? (user.email !== email ? 'phone no. and email not matched' : 'phone no. not matched') : 'email not matched'
-     })
+const now = Math.floor(Date.now() / 1000);
+const remainingLifetime = exp - now;
+
+    if (remainingLifetime > 0) {
+        await redis.set(
+            `denylist:${jti}`,
+            '1',
+            {
+                 EX: remainingLifetime
+            }
+        );
     }
+
     if(!user.signedIn){
         return res.status(400).json({message: 'user is not signed in'});
     }
@@ -854,49 +944,73 @@ app.delete('/users/me/delete', middleware, async (req, res) => {
     try {
 
 const userId = req.user.userId;
-const user = await User.findById(userId);
+
+const user = await User.findOne({
+    _id: userId,
+        deleted: false
+    });
 
     if (!user) {
-        return res.status(404).json({ message:
+        return res.status(404).json({message: 
             'user not found'
-        })
+        });
     }
 
-    await redis.del(`refreshToken:${userId}`);
+    await user.updateOne(
+        {
+            _id: userId,
+             deleted: true
+        },
+        {
+            $set: {
+                deleted: true,
+                signedIn: false
+            },
+            $inc: {
+                sessionVersion: 1,
+                version: 1
+            }
+        }
+    );
+
     await redis.del(`user:profile:${userId}`);
 
+    await redis.del(`refreshToken:${userId}`);
+
     if (user.avatar?.publicId) {
+
         try {
             await cloudinary.uploader.destroy(
-                user.avatar.publicId,
-                {
-                    resource_type: 'image',
-                    type: 'upload'
-                }
-            );
-        } 
+                    user.avatar.publicId,
+                    {
+                        resource_type: 'image',
+                        type: 'upload'
+                    }
+                );
 
-    catch (cloudinaryError){
+    } catch (cloudinaryError) {
         console.error(
-            `failed to delete: ${cloudinaryError}`
+            'Failed to delete avatar:',
+            cloudinaryError
         );
     }
 }
 
-    console.log(`logout activity for user: ${userId}`);
-    await User.findByIdAndDelete(userId);
-        return res.status(200).json({
-            message: 'account deleted'
-        })
-    }
+    return res.status(200).json({message:
+        'account deleted'
+    });
+    } catch (error) {
 
-    catch (error) {
-        console.error('delete account error:', error);
-        return res.status(500).json({
-            message: 'failed to delete'
+    console.error(
+        'delete account error:',
+            error
+        );
+
+        return res.status(500).json({message: 
+            'failed to delete account'
         });
     }
-}); 
+});
 
 
 app.get('/users/:id/auth-activity', async (req, res) => {
