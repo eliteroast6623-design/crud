@@ -636,60 +636,67 @@ app.patch('/users/me/update/:id', async (req, res) => {
 
 const userId = req.params.id;
 
-const { username, email, password, address, dateOfBirth, version } = req.body;
+const {username, email, password, address, dateOfBirth, version} = req.body;
+
 
     if (version === undefined) {
-        return res.status(400).json({
-            message: 'version is required'
+        return res.status(400).json({message: 
+            'version is required'
         });
     }
-    
-    if (!username && !email && !password && !address && !dateOfBirth) {
-        return res.status(400).json({
-            message: 'please provide at least one field'
-        })
+    if (username === undefined && email === undefined && password === undefined && address === undefined && dateOfBirth === undefined) {
+        return res.status(400).json({message: 
+            'please provide at least one field'
+        });
     }
 
 const updateUser = Object.fromEntries(
-    Object.entries({ username, email, password, address, dateOfBirth, version })
-        .filter(([value]) => value !== undefined)
+    Object.entries({username, email, address, dateOfBirth})
+        .filter(([key, value]) => value !== undefined)
     );
 
     if (password !== undefined) {
-        updateUser.password = await bcrypt.hash(password,13);
+        updateUser.password = await bcrypt.hash(password, 13);
     }
 
 const existingUser = await User.findById(userId);
 
     if (!existingUser || existingUser.deleted) {
-        return res.status(404).json({
-            message: 'User not found'
+        return res.status(404).json({message: 
+            'User not found'
         });
     }
 
-const updatedUser = await User.findByIdAndUpdate(
-    {
-        _id: userId,
-        detected: false,
-        version: version
+const updatedUser = await User.findOneAndUpdate( {
+    _id: userId,
+    deleted: false,
+    version: version
     },
-    userId,
-        { $set: updateUser,
-            $inc: {
+    {
+        $set: updateUser,
+        $inc: {
                 version: 1
             }
-         },
-    {
-        returnDocument: 'after',
-        runValidators: true
-    }
-    ).select('-password');
+        },
+        {
+            returnDocument: 'after',
+            runValidators: true
+        }).select('-password');
 
     if (!updatedUser) {
 
+const currentUser = await User.findById(userId)
+    .select('version deleted');
+
+    if (!currentUser || currentUser.deleted) {
+        return res.status(404).json({message: 
+            'User not found'
+        });
+    }
+
     return res.status(409).json({message: 
-        'Profile was modified by another request. Your version is stale.',   
-            currentVersion: existingUser.version  
+        'Profile was modified by another',
+        currentVersion: currentUser.version
         });
     }
 
@@ -700,9 +707,10 @@ const updatedUser = await User.findByIdAndUpdate(
         version: updatedUser.version,
         user: updatedUser
     });
-} 
-    catch (error) {
-        console.error('Profile update error:', error);
+
+    } catch (error) {
+
+    console.error('Profile update error:', error);
 
     return res.status(500).json({message: 
         'Internal server error'
