@@ -264,7 +264,7 @@ const missingFields = [];
     });
 }
 
-const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}]});
+const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}, {deleted: false}]});
 
 const notMatchedFields = [];
 
@@ -335,7 +335,7 @@ const missingFields = [];
     });
 }
 
-const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}]});
+const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {username}, {address}, {dateOfBirth}], deleted: false});
 
 const notMatchedFields = [];
 
@@ -453,7 +453,7 @@ const missingFields = [];
     });
 }
 
-const user = await User.findOne({$or: [{username}, {email}]});
+const user = await User.findOne({$or: [{username}, {email}], deleted: false});
     if(!user){
         return res.status(404).json({message: 'user not found'});
     }
@@ -511,12 +511,13 @@ const user = JSON.parse(cachedUser);
     }
 
     console.log('User Not Found In Redis, Checking MongoDB');
+    
 
 const user = await User.findById(userId).select(
         'phone countryCode username email address dateOfBirth version sessionVersion signedIn avatar'
     );
 
-    if (!user) {                                                   
+    if (!user || user.deleted) {                                                   
         return res.status(404).json({                                                   
             message: 'user not found'                                                   
     });                                                   
@@ -607,7 +608,7 @@ const { id } = req.params;
 
 const existingUser = await User.findById(id)
     
-    if (!existingUser) {
+    if (!existingUser || existingUser.deleted) {
         return res.status(404).json({
             message: 'user not found'
         })
@@ -631,9 +632,17 @@ const existingUser = await User.findById(id)
 
 app.patch('/users/me/update/:id', async (req, res) => {
 
+    try {
+
 const userId = req.params.id;
 
-const { username, email, password, address, dateOfBirth } = req.body;
+const { username, email, password, address, dateOfBirth, version } = req.body;
+
+    if (version === undefined) {
+        return res.status(400).json({
+            message: 'version is required'
+        });
+    }
     
     if (!username && !email && !password && !address && !dateOfBirth) {
         return res.status(400).json({
@@ -642,7 +651,7 @@ const { username, email, password, address, dateOfBirth } = req.body;
     }
 
 const updateUser = Object.fromEntries(
-    Object.entries({ username, email, password, address, dateOfBirth })
+    Object.entries({ username, email, password, address, dateOfBirth, version })
         .filter(([value]) => value !== undefined)
     );
 
@@ -652,26 +661,53 @@ const updateUser = Object.fromEntries(
 
 const existingUser = await User.findById(userId);
 
-    if (!existingUser) {
+    if (!existingUser || existingUser.deleted) {
         return res.status(404).json({
             message: 'User not found'
         });
     }
 
 const updatedUser = await User.findByIdAndUpdate(
+    {
+        _id: userId,
+        detected: false,
+        version: version
+    },
     userId,
-        { $set: updateUser },
-        {
-            returnDocument: 'after',
-            runValidators: true
-        }
+        { $set: updateUser,
+            $inc: {
+                version: 1
+            }
+         },
+    {
+        returnDocument: 'after',
+        runValidators: true
+    }
     ).select('-password');
-    
+
+    if (!updatedUser) {
+
+    return res.status(409).json({message: 
+        'Profile was modified by another request. Your version is stale.',   
+            currentVersion: existingUser.version  
+        });
+    }
+
+    await redis.del(`user:profile:${userId}`);
 
     return res.status(200).json({
         message: 'Profile updated successfully',
+        version: updatedUser.version,
         user: updatedUser
     });
+} 
+    catch (error) {
+        console.error('Profile update error:', error);
+
+    return res.status(500).json({message: 
+        'Internal server error'
+    });
+}
 });
 
 
@@ -689,16 +725,20 @@ const { username, email, password, address, dateOfBirth } = req.body;
 
 const existingUser = await User.findById(userId);
 
-    if (!existingUser) {
+    if (!existingUser || existingUser.deleted) {
         return res.status(404).json({
             message: 'User not found'
         });
     }
 
 const updateUser = Object.fromEntries(
-    Object.entries({ username, email, address, dateOfBirth })
-        .map(([key, value]) => [key, value ?? null])
-        );
+    Object.entries({ username, email, password, address, dateOfBirth, version })
+        .filter(([value]) => value !== undefined)
+    );
+
+    if (password !== undefined) {
+        updateUser.password = await bcrypt.hash(password,13);
+    }
 
 const updatedUser = await User.findByIdAndUpdate(
     userId,
@@ -994,6 +1034,11 @@ const user = await User.findOne({
             cloudinaryError
         );
     }
+    const signoutStatus = await User.findOneAndUpdate(
+        { $or: [{ username }, { email }] },
+        { $set: { deleted: true } },
+        { new: true }
+    );
 }
 
     return res.status(200).json({message:
