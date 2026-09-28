@@ -7,14 +7,15 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 
-cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-})
+    cloudinary.config({
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET,
+    });
 
-const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/jxl']
+const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/jxl'];
 const MAX_AVATAR_SIZE = 5 * 1024 * 1024;
+
 const middleware = (req, res, next) => {
 const authHeader = req.headers['authorization'];
 const token = authHeader && authHeader.split(' ')[1];
@@ -27,14 +28,13 @@ const token = authHeader && authHeader.split(' ')[1];
 
     jwt.verify(
         token,
-            process.env.ACCESS_TOKEN_SECRET,
-                async (err, decoded) => {
-
-    if (err) {
-        return res.status(403).json({message: 
-            'invalid access token'
-        });
-    }
+        process.env.ACCESS_TOKEN_SECRET,
+        async (err, decoded) => {
+            if (err) {
+                return res.status(403).json({message: 
+                    'invalid access token'
+                });
+            }
 
     try {
 
@@ -92,6 +92,7 @@ const redis = createClient({
 });
 
     redis.on('error', (err) => console.log('Redis Client Error', err));
+
 
 app.get('/healthz', (req, res) => {
     res.status(200).json({ message: 'ok' });
@@ -191,13 +192,13 @@ const User = mongoose.model('User', userSchema);
     User.collection.createIndex({
         phone: 1,},
             {unique: true,
-                partialFilterExpression: {deleted: false}
+            partialFilterExpression: {deleted: false}
             })
 
     User.collection.createIndex({
         email: 1,},
             {unique: true,
-                partialFilterExpression: {deleted: false}
+            partialFilterExpression: {deleted: false}
             })
 
 app.post('/users', async (req, res) => {
@@ -215,8 +216,8 @@ const missingFields = [];
     if (!dateOfBirth) missingFields.push('dateOfBirth');
 
     if (missingFields.length > 0) {
-    return res.status(400).json({
-        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+    return res.status(400).json({message: 
+        `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
     });
 }
 
@@ -224,8 +225,8 @@ const phoneExists = await User.exists({phone, deleted: false});
 const emailExists = await User.exists({email, deleted: false});
 
     if(phoneExists || emailExists){
-        return res.status(400).json({
-            message: phoneExists ? (emailExists ? 'phone no. and email already exists' : 'phone no. already exists') : 'email already exists'
+        return res.status(400).json({message: 
+            phoneExists ? (emailExists ? 'phone no. and email already exists' : 'phone no. already exists') : 'email already exists'
         })
     }
 
@@ -248,8 +249,6 @@ const redirect = (path) => {
 
 app.post('/users/otp/request', async (req, res) => {
 
-
-
 const {phone, countryCode, email, password, username, address, dateOfBirth } = req.body;
 
 const missingFields = [];
@@ -263,8 +262,8 @@ const missingFields = [];
     if (!dateOfBirth) missingFields.push('dateOfBirth');
 
     if (missingFields.length > 0) {
-    return res.status(400).json({
-        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+    return res.status(400).json({message: 
+        `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
     });
 }
 
@@ -273,7 +272,8 @@ const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {usernam
 const notMatchedFields = [];
 
     if (!user || user.deleted) {
-        return res.status(404).json({ message: 'user not found' });
+        return res.status(404).json({ message: 
+            'user not found' });
     }
 
     if (user.phone !== phone) notMatchedFields.push('phone');
@@ -290,12 +290,13 @@ const notMatchedFields = [];
     }
 
     if(!await bcrypt.compare(password, user.password)){
-        return res.status(400).json({message: 'incorrect password'});
+        return res.status(400).json({message: 
+            'incorrect password'});
     }
 
 const rateLimit = await slidingWindowRateLimit(
     `rate-limit:otp:${phone}`,
-    8,
+    5,
     60
 );
 
@@ -307,10 +308,25 @@ const rateLimit = await slidingWindowRateLimit(
     }
 
 const otp = crypto.randomInt(100000, 999999).toString();
-
 const otpHash = await bcrypt.hash(otp, 13);
 
-    await redis.set(`otp:cooldown:${phone}`, '1', { EX: 30 });
+    await redis.set(`otp:hash:${phone}`,
+        otpHash,
+            { EX: 300 }
+        );
+
+    await redis.set(`otp:attempts:${phone}`,
+        '0',
+            { EX: 300 }
+        );
+
+    await redis.del(`otp:lock:${phone}`);
+
+    await redis.set(`otp:cooldown:${phone}`,
+        '1',
+            { EX: 30 }
+        );
+
     console.log('OTP:', otp);
 
 const redirect = (path) => {
@@ -336,6 +352,7 @@ const missingFields = [];
     if (!username) missingFields.push('username');
     if (!address) missingFields.push('address');
     if (!dateOfBirth) missingFields.push('dateOfBirth');
+    if (!otp) missingFields.push('otp');
     
     if (missingFields.length > 0) {
     return res.status(400).json({
@@ -364,7 +381,7 @@ const notMatchedFields = [];
         });
     } 
 
-const otpKey = `otp:${phone}`;
+const otpKey = `otp:hash:${phone}`;
 const attemptsKey = `otp:attempts:${phone}`;
 const sharedOtpHash = await redis.get(otpKey);
 
@@ -380,51 +397,49 @@ const attempts = Number(await redis.get(attemptsKey)) || 0;
         await redis.del(otpKey);
         await redis.del(attemptsKey);
 
-        return res.status(400).json({
-            message: 'too many attempts'
-        })
-    }
+    return res.status(400).json({message: 
+        'too many attempts'
+    })
+}
 
 const isValidOtp = await bcrypt.compare(otp, sharedOtpHash);
 
     if (!isValidOtp) {
+
 const newAttempts = attempts + 1;
 
-    if (newAttempts >= 5) {
-        await redis.del(otpKey);
-        await redis.del(attemptsKey);
-        return res.status(400).json({
-            message: 'too many incorrect attempts'
-        })
-    }
+    await redis.set(
+        attemptsKey,
+        newAttempts,
+        { EX: 300 }
+    );
 
-        await redis.set(
-            attemptsKey,
-            newAttempts,
-            { EX: 300 }
-        )
-
-        return res.status(400).json({
-            message: `Invalid OTP. ${5 - newAttempts} attempts remaining`
-        });
-    }
+    return res.status(400).json({message: 
+        `Invalid OTP. ${5 - newAttempts} attempts remaining`
+    });
+}
 
 const accessToken = jwt.sign(
-    { userId: user._id,
-        sessionVersion: user.sessionVersion
+    {
+    userId: user._id,
+    sessionVersion: user.sessionVersion
     },
     process.env.ACCESS_TOKEN_SECRET,
-    { expiresIn: '15m',
-        jwtid: crypto.randomUUID() }
+    { 
+    expiresIn: '15m',
+    jwtid: crypto.randomUUID() 
+    }
 );
 const refreshToken = jwt.sign(
-    { userId: user._id,
-        sessionVersion: user.sessionVersion
+    { 
+    userId: user._id,
+    sessionVersion: user.sessionVersion
     },
     process.env.REFRESH_TOKEN_SECRET,
-    { expiresIn: '7d',
-        jwtid: crypto.randomUUID()
-     }
+    { 
+    expiresIn: '7d',
+    jwtid: crypto.randomUUID()
+    }
 );
 
     await AuthActivity.create({
@@ -432,15 +447,12 @@ const refreshToken = jwt.sign(
     eventType: 'otp-login'
 });
 
-    await redis.del(otpKey);
-    await redis.del(attemptsKey);
-
 const redirect = (path) => {
-        return path;
-    }
+    return path;
+}
 
-    return res.status(200).json({
-        message: 'OTP verified', accessToken, refreshToken, next: redirect('/users/login')
+    return res.status(200).json({message: 
+        'OTP verified', accessToken, refreshToken, next: redirect('/users/login')
     })
 })
     
@@ -456,10 +468,10 @@ const missingFields = [];
     if (!username) missingFields.push('username');
     
     if (missingFields.length > 0) {
-    return res.status(400).json({
-        message: `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
-    });
-}
+        return res.status(400).json({message: 
+            `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required`
+        });
+    }
 
 const user = await User.findOne({$or: [{username}, {email}], deleted: false});
 
@@ -491,18 +503,25 @@ const loginRateLimit = await slidingWindowRateLimit(
     }
 
 const accessToken = jwt.sign(
-    { userId: user._id, sessionVersion: user.sessionVersion },
+    { 
+    userId: user._id, 
+    sessionVersion: user.sessionVersion 
+    },
     process.env.ACCESS_TOKEN_SECRET,
     { 
-        expiresIn: '15m',
-        jwtid: crypto.randomUUID() 
+    expiresIn: '15m',
+    jwtid: crypto.randomUUID() 
     }
 );
 const refreshToken = jwt.sign(
-    { userId: user._id, sessionVersion: user.sessionVersion },
+    { 
+    userId: user._id, 
+    sessionVersion: user.sessionVersion 
+    },
     process.env.REFRESH_TOKEN_SECRET,
-    { expiresIn: '7d',
-        jwtid: crypto.randomUUID()
+    { 
+    expiresIn: '7d',
+    jwtid: crypto.randomUUID()
     }
 );
     await AuthActivity.create({
@@ -544,8 +563,8 @@ const user = JSON.parse(cachedUser);
     console.log('User Not Found In Redis, Checking MongoDB');
 
 const user = await User.findById(userId).select(
-        'phone countryCode username email address dateOfBirth version sessionVersion signedIn avatar'
-    );
+    'phone countryCode username email address dateOfBirth version sessionVersion signedIn avatar'
+);
 
     if (!user || user.deleted) {                                                   
         return res.status(404).json({                                                   
@@ -597,7 +616,8 @@ const {jti, exp, userId} = req.user;
             'invalid access token'
         })
     }
-    const user = await User.findById(userId);
+
+const user = await User.findById(userId);
 
     if(!user){
         return res.status(404).json({message:
@@ -696,7 +716,8 @@ const existingUser = await User.findById(userId);
         });
     }
 
-const updatedUser = await User.findOneAndUpdate( {
+const updatedUser = await User.findOneAndUpdate( 
+    {
     _id: userId,
     deleted: false,
     version: version
@@ -713,7 +734,6 @@ const updatedUser = await User.findOneAndUpdate( {
         }).select('-password');
 
     if (!updatedUser) {
-
 const currentUser = await User.findById(userId)
     .select('version deleted');
 
@@ -760,8 +780,6 @@ const { username, email, password, address, dateOfBirth, version } = req.body;
         })
     }
 
-    
-
 const existingUser = await User.findById(userId);
 
     if (!existingUser || existingUser.deleted) {
@@ -805,14 +823,14 @@ const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/we
 const { contentType } = req.body;
 
     if (!contentType) {
-        return res.status(400).json({
-            message: 'contentType is required'
-    });
-        }
+        return res.status(400).json({message: 
+            'contentType is required'
+        });
+    }
 
     if (!ALLOWED_CONTENT_TYPES.includes(contentType)){
-        return res.status(400).json({
-            message: 'unsupported content type'
+        return res.status(400).json({message: 
+            'unsupported content type'
         })
     }
 
@@ -851,74 +869,79 @@ const signature = cloudinary.utils.api_sign_request({
 }});
 
 
-app.post('/users/me/avatar/confirm', middleware, async (req, res) => {
-        
-    try {
-        
-const userId = req.user.userId;
 
+
+
+
+
+
+
+
+
+
+
+
+
+app.post('/users/me/avatar/confirm', middleware, async (req, res) => {
+
+    try {
+
+const userId = req.user.userId;
 const { publicId } = req.body;
 
     if (!publicId) {
-        return res.status(400).json({ message:
+        return res.status(400).json({message: 
             'publicId is required'
-                });
-            }
-            
-const expectedPrefix =`avatars/${userId}/`;
+        });
+    }
+
+const expectedPrefix = `avatars/${userId}/`;
 
     if (!publicId.startsWith(expectedPrefix)) {
-        return res.status(403).json({
-            message: 'Invalid avatar object'
-                });
-            } 
+        return res.status(403).json({message: 
+            'Invalid publicId'
+        });
+    }
+
+const destroyAvatar = async () => {
+    await cloudinary.uploader.destroy(publicId, {
+        resource_type: 'image',
+        type: 'upload'
+    });
+};
 
     let resource;
 
-    try {resource =
-        await cloudinary.api.resource(publicId,{
+    try {
+        resource = await cloudinary.api.resource(publicId, {
             resource_type: 'image',
             type: 'upload'
-    });
-    }
-
-    catch (error) {if (error?.http_code === 404) {
-        return res.status(404).json({message:
-            'Uploaded avatar not found'
-        }); 
-    }
-    throw error;
-    }
+        });
+    } catch (error) {
+        if (error?.http_code === 404) {
+            return res.status(404).json({message: 
+                'Uploaded avatar not found'
+            });
+        }
+            throw error;
+        }
 
     if (resource.resource_type !== 'image') {
-        await cloudinary.uploader.destroy(
-            publicId,
-            {
-            resource_type: 'image',
-            type: 'upload'
-            }
-        );
-
-    return res.status(400).json({message:
-        'Uploaded object is not an image'
-        });
-    }
+        await destroyAvatar();
+            return res.status(400).json({message: 
+                'Uploaded object is not an image'
+            });
+        }
 
 const allowedFormats = ['jpg', 'jpeg', 'png', 'webp', 'jxl'];
-const actualFormat =resource.format?.toLowerCase();
-  
-    if (!allowedFormats.includes(actualFormat)) {
-        await cloudinary.uploader.destroy(
-            publicId,{
-                resource_type: 'image',
-                type: 'upload'
-            }
-        );
+const actualFormat = resource.format?.toLowerCase();
 
-    return res.status(400).json({message:
-        'Unsupported avatar format'
-        });
-    }
+    if (!allowedFormats.includes(actualFormat)) {
+        await destroyAvatar();
+            return res.status(400).json({message: 
+                'Unsupported avatar format'
+            });
+        }
 
 const actualSize = resource.bytes;
 
@@ -926,16 +949,11 @@ const actualSize = resource.bytes;
         typeof actualSize !== 'number' ||
         actualSize <= 0 ||
         actualSize > MAX_AVATAR_SIZE
-        ) {
-        await cloudinary.uploader.destroy(
-            publicId,
+        ) 
         {
-            resource_type: 'image',
-            type: 'upload'
-        });
-
-    return res.status(400).json({message:
-        'Avatar size exceeds allowed limit'
+            await destroyAvatar();
+            return res.status(400).json({message: 
+                'Avatar size exceeds allowed limit'
             });
         }
 
@@ -945,73 +963,56 @@ const formatToContentType = {
     png: 'image/png',
     webp: 'image/webp',
     jxl: 'image/jxl'
-    };
+};
 
-const actualContentType =formatToContentType[actualFormat];
+const actualContentType = formatToContentType[actualFormat];
 const user = await User.findById(userId);
 
     if (!user) {
-        await cloudinary.uploader.destroy(
-            publicId,{
-                resource_type: 'image',
-                type: 'upload'
+        await destroyAvatar();
+            return res.status(404).json({message: 
+                'User not found'
             });
+        }
 
-    return res.status(404).json({message:
-        'User not found'
-    });
-}
-
-const oldAvatarPublicId =
-    user.avatar?.publicId || null;
+const oldAvatarPublicId = user.avatar?.publicId || null;
 
     user.avatar = {
-    publicId: publicId,
-    secureUrl: resource.secure_url,
-    contentType: actualContentType,
-    size: actualSize
+        publicId,
+        secureUrl: resource.secure_url,
+        contentType: actualContentType,
+        size: actualSize
     };
 
     await user.save();
 
-    if (
-        oldAvatarPublicId &&
-        oldAvatarPublicId !== publicId
-    ) {
-
-    try {
-    await cloudinary.uploader.destroy(
-        oldAvatarPublicId,
-        {
-            resource_type: 'image',
-            type: 'upload'
-        });
-    } 
-
-    catch (deleteError) {
-        console.error(
-            'Failed to delete old avatar:',
+    if (oldAvatarPublicId && oldAvatarPublicId !== publicId) {
+        try {
+            await cloudinary.uploader.destroy(oldAvatarPublicId, {
+                resource_type: 'image',
+                type: 'upload'
+            });
+        } catch (deleteError) {
+            console.error(
+                'Failed to delete old avatar:',
                 deleteError
-            );}
+            );
         }
+    }
 
-    return res.status(200).json({message:
-        'Avatar updated successfully',
-            avatar: {
-                publicId:publicId,
-                secureUrl:resource.secure_url,
-                contentType:actualContentType,
-                size:actualSize
-            }
-        });
-    } 
-    
-    catch (error) {
+    return res.status(200).json({
+        message: 'Avatar updated successfully',
+        avatar: user.avatar
+    });
+
+    } catch (error) {
+
         console.error(
-            'Avatar confirmation error:', error
+            'Avatar confirmation error:',
+            error
         );
 
-    return res.status(500).json({message:
+    return res.status(500).json({message: 
         'Failed to confirm avatar'
     });
 }
@@ -1111,7 +1112,6 @@ const filter = {
             if (from) {
                 filter.createdAt.$gte = new Date(from);
             }
-
             if (to) {
                 filter.createdAt.$lte = new Date(to);
             }
@@ -1121,11 +1121,11 @@ const filter = {
 
     let decodedCursor;
 
-        try {
-            decodedCursor = JSON.parse(
-                Buffer.from(cursor, 'base64url').toString('utf8')
-            );
-        } 
+    try {
+        decodedCursor = JSON.parse(
+            Buffer.from(cursor, 'base64url').toString('utf8')
+        );
+    } 
     
     catch (error) {
         return res.status(400).json({message: 
