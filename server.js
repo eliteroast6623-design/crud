@@ -248,6 +248,8 @@ const redirect = (path) => {
 
 app.post('/users/otp/request', async (req, res) => {
 
+
+
 const {phone, countryCode, email, password, username, address, dateOfBirth } = req.body;
 
 const missingFields = [];
@@ -291,20 +293,22 @@ const notMatchedFields = [];
         return res.status(400).json({message: 'incorrect password'});
     }
 
-const cooldown = await redis.get(`otp:cooldown:${phone}`);
+const rateLimit = await slidingWindowRateLimit(
+    `rate-limit:otp:${phone}`,
+    8,
+    60
+);
 
-    if(cooldown){
-        return res.status(429).json({message: 'wait for 30 seconds'});
+    if (!rateLimit.allowed) {
+        return res.status(429).json({message: 
+            'too many OTP requests',
+            retryAfter: rateLimit.retryAfter
+        });
     }
 
 const otp = crypto.randomInt(100000, 999999).toString();
 
-
 const otpHash = await bcrypt.hash(otp, 13);
-
-    await redis.set(`otp:${phone}`, otpHash, {
-        EX: 300
-    });
 
     await redis.set(`otp:cooldown:${phone}`, '1', { EX: 30 });
     console.log('OTP:', otp);
@@ -458,40 +462,64 @@ const missingFields = [];
 }
 
 const user = await User.findOne({$or: [{username}, {email}], deleted: false});
-    if(!user){
+
+    if(!user || user.deleted){
         return res.status(404).json({message: 'user not found'});
+    }
+
+const isMatch = user.username === username && user.email === email;
+
+    if (!isMatch) {
+        return res.status(404).json({message: 'username or email do not match'});
     }
 
     if(!await bcrypt.compare(password, user.password)){
         return res.status(400).json({message: 'incorrect password'});
     }
+
+const loginRateLimit = await slidingWindowRateLimit(
+    `rate-limit:login:${user._id}`,
+    10,
+    60
+);
+
+    if (!loginRateLimit.allowed) {
+        return res.status(429).json({message: 
+            'too many login attempts',
+            retryAfter: loginRateLimit.retryAfter
+        });
+    }
+
 const accessToken = jwt.sign(
-        { userId: user._id, sessionVersion: user.sessionVersion },
-        process.env.ACCESS_TOKEN_SECRET,
-        { expiresIn: '15m',
-            jwtid: crypto.randomUUID() }
-    );
+    { userId: user._id, sessionVersion: user.sessionVersion },
+    process.env.ACCESS_TOKEN_SECRET,
+    { 
+        expiresIn: '15m',
+        jwtid: crypto.randomUUID() 
+    }
+);
 const refreshToken = jwt.sign(
-        { userId: user._id, sessionVersion: user.sessionVersion },
-        process.env.REFRESH_TOKEN_SECRET,
-        { expiresIn: '7d',
-            jwtid: crypto.randomUUID()
-         }
-    );
+    { userId: user._id, sessionVersion: user.sessionVersion },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: '7d',
+        jwtid: crypto.randomUUID()
+    }
+);
     await AuthActivity.create({
         userId: user._id,
         sessionVersion: user.sessionVersion,
         eventType: 'login'
 });
+    
 const signInStatus = await User.findOneAndUpdate(
-        { $or: [{ username }, { email }] },
-        { $set: { signedIn: true } },
-        { new: true }
-    );
+    { $or: [{ username }, { email }] },
+    { $set: { signedIn: true } },
+    { new: true }
+);
 
-    const redirect = (path) => {
-        return path;
-    }
+const redirect = (path) => {
+    return path;
+}
     await user.save();
 
     return res.status(200).json({message: 'login successful', accessToken, refreshToken, next: redirect('/users/me')});
@@ -1159,6 +1187,7 @@ const cursorData = {
     return res.status(200).json({
         userId: id,
         limit,
+        totalRecords: records.length,
         logins: page.map(record => ({
             eventType: record.eventType,
             timestamp: record.createdAt
@@ -1175,6 +1204,54 @@ const cursorData = {
     });
 }
 });
+
+
+    async function slidingWindowRateLimit(key, limit, windowSeconds) {
+
+const now = Date.now();
+const windowStart = now - (windowSeconds * 1000);
+const multi = redis.multi();
+
+    multi.zRemRangeByScore(key, 0, windowStart);
+
+const requestId = `${now}-${crypto.randomUUID()}`;
+
+    multi.zAdd(key, {
+        score: now,
+        value: requestId
+    });
+
+    multi.zCard(key);
+
+    multi.expire(key, windowSeconds);
+
+const results = await multi.exec();
+const count = Number(results[2]);
+
+    if (count > limit) {
+        await redis.zRem(key, requestId);
+
+const oldest = await redis.zRangeWithScores(key, 0, 0);
+
+    let retryAfter = windowSeconds;
+
+    if (oldest.length > 0) {
+        retryAfter = Math.ceil(
+            (Number(oldest[0].score) + windowSeconds * 1000 - now) / 1000
+        );
+    }
+
+    return {
+        allowed: false,
+        retryAfter
+    };
+}
+
+    return {
+        allowed: true,
+        retryAfter: 0
+    };
+}
 
 redis.connect().then(() => {
     console.log('connected to redis');
