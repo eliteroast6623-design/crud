@@ -128,6 +128,8 @@ const authActivitySchema = new mongoose.Schema({
     }
 });
 
+    authActivitySchema.index({ userId: 1, createdAt: -1, id: -1 });
+
 const AuthActivity = mongoose.model('AuthActivity', authActivitySchema);
 
     mongoose.connect('mongodb://localhost:27017/crud-app',)
@@ -268,7 +270,7 @@ const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {usernam
 
 const notMatchedFields = [];
 
-    if (!user) {
+    if (!user || user.deleted) {
         return res.status(404).json({ message: 'user not found' });
     }
 
@@ -296,6 +298,8 @@ const cooldown = await redis.get(`otp:cooldown:${phone}`);
     }
 
 const otp = crypto.randomInt(100000, 999999).toString();
+
+
 const otpHash = await bcrypt.hash(otp, 13);
 
     await redis.set(`otp:${phone}`, otpHash, {
@@ -339,7 +343,7 @@ const user = await User.findOne({$or: [{phone}, {countryCode}, {email}, {usernam
 
 const notMatchedFields = [];
 
-    if (!user) {
+    if (!user || user.deleted) {
         return res.status(404).json({ message: 'user not found' });
     }
 
@@ -488,7 +492,6 @@ const signInStatus = await User.findOneAndUpdate(
     const redirect = (path) => {
         return path;
     }
-
     await user.save();
 
     return res.status(200).json({message: 'login successful', accessToken, refreshToken, next: redirect('/users/me')});
@@ -511,7 +514,6 @@ const user = JSON.parse(cachedUser);
     }
 
     console.log('User Not Found In Redis, Checking MongoDB');
-    
 
 const user = await User.findById(userId).select(
         'phone countryCode username email address dateOfBirth version sessionVersion signedIn avatar'
@@ -638,7 +640,6 @@ const userId = req.params.id;
 
 const {username, email, password, address, dateOfBirth, version} = req.body;
 
-
     if (version === undefined) {
         return res.status(400).json({message: 
             'version is required'
@@ -719,17 +720,19 @@ const currentUser = await User.findById(userId)
 });
 
 
-app.put('/users/me/replace/:id', async (req, res) => {
+app.put('/users/me/replace/:id', middleware, async (req, res) => {
 
 const userId = req.params.id;
 
-const { username, email, password, address, dateOfBirth } = req.body;
+const { username, email, password, address, dateOfBirth, version } = req.body;
     
     if (!username && !email && !password && !address && !dateOfBirth) {
         return res.status(400).json({
             message: 'please provide at least one field'
         })
     }
+
+    
 
 const existingUser = await User.findById(userId);
 
@@ -989,13 +992,12 @@ const oldAvatarPublicId =
 
 app.delete('/users/me/delete', middleware, async (req, res) => {
 
-    try {
-
 const userId = req.user.userId;
 
 const user = await User.findOne({
     _id: userId,
-        deleted: false
+        deleted: false,
+        signedIn: true
     });
 
     if (!user) {
@@ -1007,7 +1009,8 @@ const user = await User.findOne({
     await user.updateOne(
         {
             _id: userId,
-             deleted: true
+             deleted: true,
+             signedIn: false
         },
         {
             $set: {
@@ -1022,116 +1025,153 @@ const user = await User.findOne({
     );
 
     await redis.del(`user:profile:${userId}`);
-
     await redis.del(`refreshToken:${userId}`);
 
     if (user.avatar?.publicId) {
 
-        try {
-            await cloudinary.uploader.destroy(
-                    user.avatar.publicId,
-                    {
-                        resource_type: 'image',
-                        type: 'upload'
-                    }
-                );
-
-    } catch (cloudinaryError) {
-        console.error(
-            'Failed to delete avatar:',
-            cloudinaryError
+        await cloudinary.uploader.destroy(
+                user.avatar.publicId,
+            {
+                resource_type: 'image',
+                type: 'upload'
+            }
         );
     }
-    const signoutStatus = await User.findOneAndUpdate(
-        { $or: [{ username }, { email }] },
-        { $set: { deleted: true } },
-        { new: true }
-    );
-}
+
+const username = user.username;
+const email = user.email;
+
+const signoutStatus = await User.findOneAndUpdate(
+    { $or: [{ username }, { email }] },
+    { $set: { deleted: true } },
+    { new: true }
+);
 
     return res.status(200).json({message:
         'account deleted'
     });
-    } catch (error) {
-
-    console.error(
-        'delete account error:',
-            error
-        );
-
-        return res.status(500).json({message: 
-            'failed to delete account'
-        });
-    }
 });
 
 
 app.get('/users/:id/auth-activity', async (req, res) => {
 
     try {
-        
+
 const { id } = req.params;
-const { eventType, from, to } = req.query;
+const { eventType, from, to, cursor } = req.query;
+
+    let limit = Number(req.query.limit) || 10;
+
+    if (limit < 1) {
+        limit = 1;
+    }
+
+    if (limit > 50) {
+        limit = 50;
+    }
 
 const filter = {
     userId: new mongoose.Types.ObjectId(id)
-    }
+    };
 
     if (eventType) {
         filter.eventType = eventType;
-        }
+    }
+
     if (from || to) {
         filter.createdAt = {};
-        if (from && to) {
-            filter.createdAt.$gte = new Date(from);
-            filter.createdAt.$lte = new Date(to);
+            if (from) {
+                filter.createdAt.$gte = new Date(from);
+            }
+
+            if (to) {
+                filter.createdAt.$lte = new Date(to);
+            }
         }
+
+    if (cursor) {
+
+    let decodedCursor;
+
+        try {
+            decodedCursor = JSON.parse(
+                Buffer.from(cursor, 'base64url').toString('utf8')
+            );
+        } 
+    
+    catch (error) {
+        return res.status(400).json({message: 
+            'invalid cursor'
+        });
     }
 
-const result = await AuthActivity.aggregate([{
-    $match: filter
-    },
+const cursorDate = new Date(decodedCursor.createdAt);
+const cursorId = new mongoose.Types.ObjectId(
+    decodedCursor.id
+);
+
+    filter.$or = [
         {
-            $facet: {
-                totalLogins: [
-                    {
-                        $count: 'count'
-                    }
-                ],
-            loginTimestamps: [
-                {
-                    $sort: {
-                        createdAt: -1
-                        }
-                },
-                {
-                    $project: {
-                    _id: 0,
-                    eventType: 1,
-                    timestamp: '$createdAt'
-                    }
+            createdAt: {
+                $lt: cursorDate
+            }
+        },
+        {
+            createdAt: cursorDate,
+            _id: {
+                    $lt: cursorId
                 }
-            ]
         }
-    }
-]);
+    ];
+}
 
-const totalLogins =
-    result[0].totalLogins.length > 0
-    ? result[0].totalLogins[0].count
-    :0;
+const records = await AuthActivity.find(filter)
+    .sort({
+        createdAt: -1,
+         _id: -1
+    })
+        .limit(limit + 1)
+        .select('_id eventType createdAt')
+        .lean();
+
+const hasNextPage = records.length > limit;
+
+const page = hasNextPage
+    ? records.slice(0, limit)
+    : records;
+
+    let nextCursor = null;
+
+    if (hasNextPage) {
+
+const lastRecord = page[page.length - 1];
+
+const cursorData = {
+    createdAt: lastRecord.createdAt.toISOString(),
+    id: lastRecord._id.toString()
+    };
+
+    nextCursor = Buffer
+        .from(JSON.stringify(cursorData))
+        .toString('base64url');
+    }
 
     return res.status(200).json({
         userId: id,
-        totalLogins,
-        logins: result[0].loginTimestamps});
-    }
- 
+        limit,
+        logins: page.map(record => ({
+            eventType: record.eventType,
+            timestamp: record.createdAt
+        })),
+        nextCursor
+        });
+    } 
     catch (error) {
+
         console.error('auth activity error:', error);
 
-    return res.status(500).json({
-        message: 'Internal server error'
+    return res.status(500).json({message: 
+        'Internal server error'
     });
 }
 });
