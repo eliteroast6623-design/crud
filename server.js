@@ -533,7 +533,7 @@ const refreshToken = jwt.sign(
 const signInStatus = await User.findOneAndUpdate(
     { $or: [{ username }, { email }] },
     { $set: { signedIn: true } },
-    { new: true }
+    { returnDocument: 'after' }
 );
 
 const redirect = (path) => {
@@ -644,7 +644,7 @@ const remainingLifetime = exp - now;
     
 const signoutStatus = await user.updateOne(
         { $set: { signedIn: false } },
-        { new: true }
+        { returnDocument: 'after' }
     );
     return res.status(200).json({message: 'logout successful'});
 });
@@ -817,9 +817,7 @@ app.post('/users/me/avatar/presign', middleware, async (req, res) => {
     try {
 
 const userId = req.user.userId;
-
 const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/jxl'];    
-
 const { contentType } = req.body;
 
     if (!contentType) {
@@ -867,19 +865,6 @@ const signature = cloudinary.utils.api_sign_request({
         'Failed to generate avatar upload authorization'
     });
 }});
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 app.post('/users/me/avatar/confirm', middleware, async (req, res) => {
@@ -1025,13 +1010,13 @@ const userId = req.user.userId;
 
 const user = await User.findOne({
     _id: userId,
-        deleted: false,
-        signedIn: true
+    deleted: false,
+    signedIn: true
     });
 
     if (!user) {
         return res.status(404).json({message: 
-            'user not found'
+            'user not fodun'
         });
     }
 
@@ -1073,7 +1058,7 @@ const email = user.email;
 const signoutStatus = await User.findOneAndUpdate(
     { $or: [{ username }, { email }] },
     { $set: { deleted: true } },
-    { new: true }
+    { returnDocument: 'after' }
 );
 
     return res.status(200).json({message:
@@ -1128,7 +1113,7 @@ const filter = {
     } 
     
     catch (error) {
-        return res.status(400).json({message: 
+        return res.status(400).json({message:
             'invalid cursor'
         });
     }
