@@ -184,6 +184,12 @@ const userSchema = new mongoose.Schema({
     },
     sessionVersion:{
         type: Number, default: 0
+    },
+    createdAt:{
+        type: Date, deault: Date.now
+    },
+    updatedAt:{
+        type: Date, deault: Date.now
     }
 })
 
@@ -240,6 +246,10 @@ const redirect = (path) => {
     return path;
 }
 
+    const createdAt = new Date();
+    const updatedAt = new Date();
+    user.createdAt = createdAt;
+    user.updatedAt = updatedAt;
     await user.save();
 
     res.status(201).json({message: 'created user resource', next: redirect('/users/otp/request')});
@@ -308,18 +318,16 @@ const rateLimit = await slidingWindowRateLimit(
     }
 
 const otp = crypto.randomInt(100000, 999999).toString();
-const otpHash = await bcrypt.hash(otp, 13);
 
-    await redis.set(`otp:hash:${phone}`,
-        otpHash,
+await redis.set(`otp:${phone}`,
+        otp,
             { EX: 300 }
-        );
-
+    );
     await redis.set(`otp:attempts:${phone}`,
         '0',
-            { EX: 300 }
+            { EX: 300 },
         );
-
+        
     await redis.del(`otp:lock:${phone}`);
 
     await redis.set(`otp:cooldown:${phone}`,
@@ -381,11 +389,11 @@ const notMatchedFields = [];
         });
     } 
 
-const otpKey = `otp:hash:${phone}`;
+const otpKey = `otp:${phone}`;
 const attemptsKey = `otp:attempts:${phone}`;
-const sharedOtpHash = await redis.get(otpKey);
+const sharedOtp = await redis.get(otpKey);
 
-    if (!sharedOtpHash) {
+    if (!sharedOtp) {
         return res.status(400).json({
             message: 'OTP expired or wrong otp'
         });
@@ -402,7 +410,7 @@ const attempts = Number(await redis.get(attemptsKey)) || 0;
     })
 }
 
-const isValidOtp = await bcrypt.compare(otp, sharedOtpHash);
+const isValidOtp = otp === sharedOtp;
 
     if (!isValidOtp) {
 
@@ -514,7 +522,7 @@ const accessToken = jwt.sign(
     }
 );
 const refreshToken = jwt.sign(
-    { 
+    {
     userId: user._id, 
     sessionVersion: user.sessionVersion 
     },
@@ -720,12 +728,16 @@ const updatedUser = await User.findOneAndUpdate(
     {
     _id: userId,
     deleted: false,
-    version: version
+    version: version,
+    updatedAt: { $lte: new Date() }
     },
     {
         $set: updateUser,
+        $set: {
+            updatedAt: new Date()
+        },
         $inc: {
-                version: 1
+                version: 1,
             }
         },
         {
@@ -799,8 +811,12 @@ const updateUser = Object.fromEntries(
 
 const updatedUser = await User.findByIdAndUpdate(
     userId,
-        { $set: updateUser },
-        { returnDocument : 'after',}
+        { $set: updateUser,
+            updatedAt: new Date(),
+         },
+        { returnDocument : 'after',
+          updatedAt: { $lte: new Date() },
+        }
     ).select('-password');
     const hashedPassword = await bcrypt.hash(password, 13);
     updatedUser.password = hashedPassword;
